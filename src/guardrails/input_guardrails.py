@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -51,14 +52,28 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
+    # Bước 1: Chuẩn hóa Unicode (NFKC) để gộp các ký tự đồng dạng (homoglyph/full-width)
+    # và loại bỏ ký tự ẩn zero-width (\u200b, \ufeff...) mà kẻ tấn công hay chèn vào giữa từ khóa.
+    normalized = unicodedata.normalize("NFKC", user_input)
+    normalized = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", normalized)
+    # Gộp nhiều khoảng trắng liên tiếp thành 1 dấu cách để regex khớp chính xác
+    cleaned = re.sub(r"\s+", " ", normalized).strip()
+
+    # Bước 2: Danh sách regex bắt các mẫu prompt injection / jailbreak phổ biến
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore\s+(all\s+)?(previous|above)\s+instructions",
+        r"you\s+are\s+now",
+        r"system\s+prompt",
+        r"reveal\s+your\s+(instructions|prompt)",
+        r"pretend\s+you\s+are",
+        r"act\s+as\s+(a\s+|an\s+)?unrestricted",
+        r"forget\s+(all\s+)?(previous|your)\s+instructions",
+        r"bypass\s+(all\s+)?(safety|guardrails|rules|filters)",
     ]
 
+    # Bước 3: Kiểm tra không phân biệt hoa/thường; khớp bất kỳ pattern nào -> chặn ngay
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, cleaned, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +99,24 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = user_input.lower().strip()
+    # Chuỗi rỗng hoặc chỉ có khoảng trắng -> chặn (edge case)
+    if not input_lower:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # Mentioning banking in a negation does not make a cooking request on-topic.
+    if re.search(r"\b(?:recipe\s+for|how\s+to\s+(?:cook|bake))\b", input_lower):
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    # Ưu tiên kiểm tra danh sách chủ đề bị cấm trước (hack, weapon, illegal...)
+    if any(topic in input_lower for topic in BLOCKED_TOPICS):
+        return "BLOCK"
+
+    # Chỉ cho phép nếu câu hỏi có chứa ít nhất 1 từ khóa thuộc chủ đề ngân hàng (ALLOWED_TOPICS)
+    if not any(topic in input_lower for topic in ALLOWED_TOPICS):
+        return "BLOCK"
+
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +169,22 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # Lớp 1: Chặn nếu phát hiện dấu hiệu prompt injection / jailbreak
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked: potential prompt injection detected."
+            )
 
-        pass  # Replace with your implementation
+        # Lớp 2: Chặn nếu lạc đề (không liên quan ngân hàng) hoặc dính chủ đề cấm
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked: please ask questions related to VinBank banking services."
+            )
+
+        # Trả về None để ADK cho phép message đi tiếp vào LLM
+        return None
 
 
 # ============================================================

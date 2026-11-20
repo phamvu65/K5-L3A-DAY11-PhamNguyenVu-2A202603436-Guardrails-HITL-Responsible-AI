@@ -13,6 +13,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
 
 
 # ============================================================
@@ -39,14 +40,21 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
+    # Secrets must be removed even without a label such as "password is".
+    for secret in sorted(DEMO_SECRETS, key=len, reverse=True):
+        if secret and re.search(re.escape(secret), redacted, re.IGNORECASE):
+            issues.append("protected value found")
+            redacted = re.sub(re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE)
+
     # PII patterns to check
+    # Danh sách regex nhận diện thông tin nhạy cảm (PII) và secret cần che trước khi trả về user
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "vn_phone": r"0\d{9,10}",                      # Số điện thoại Việt Nam (10-11 chữ số, bắt đầu bằng 0)
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",     # Địa chỉ email
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",        # CMND (9 số) hoặc CCCD (12 số)
+        "api_key": r"sk-[a-zA-Z0-9-]+",                # API key dạng sk-...
+        "password": r"password\s*(?::|=|\bis\b)\s*\S+", # Chuỗi tiết lộ mật khẩu (password: / = / is ...)
+        "db_host": r"db\.vinbank\.internal(?::\d+)?",  # Địa chỉ DB nội bộ VinBank
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -172,16 +180,33 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # Bước 1: Dùng regex quét và che (redact) PII / secret trong câu trả lời của LLM
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            response_text = filter_result["redacted"]
+            # Ghi đè nội dung trả về bằng bản đã thay thế [REDACTED]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        # Bước 2 (Optional): Nếu bật LLM-as-Judge thì kiểm tra thêm độ an toàn ngữ nghĩa
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text="Response blocked due to safety policy."
+                        )
+                    ],
+                )
+
+        # Trả về llm_response (đã chỉnh sửa nếu có vi phạm, hoặc giữ nguyên nếu an toàn)
+        return llm_response
 
 
 # ============================================================
